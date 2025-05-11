@@ -1,28 +1,34 @@
-# attention_app.py
-import cv2
 import streamlit as st
+import cv2
 import torch
 import joblib
 import numpy as np
+from torchvision import transforms, models
 from PIL import Image
-from torchvision import models, transforms
+from scipy.spatial.distance import cdist
 from collections import deque
 
-# Setup
-st.title("🧠 Real-time Attention Detection")
-FRAME_WINDOW = st.image([])
-
+# Load ResNet18
+from torchvision.models import resnet18, ResNet18_Weights
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Load ResNet
-model = models.resnet18(pretrained=True)
+model = resnet18(weights=ResNet18_Weights.DEFAULT)
 model = torch.nn.Sequential(*list(model.children())[:-1])
 model.eval().to(device)
 
-# Load classifier
-clf = joblib.load("attention_classifier.pkl")
+# Load saved embeddings and labels
+X_ref, y_ref = joblib.load("attention_memory.pkl")
+X_ref = np.array(X_ref)
+y_ref = np.array(y_ref)
 
-# Transform
+# Balance reference dataset
+min_count = min(np.sum(y_ref == 0), np.sum(y_ref == 1))
+att = np.where(y_ref == 0)[0]
+inatt = np.where(y_ref == 1)[0]
+np.random.shuffle(att); np.random.shuffle(inatt)
+X_ref = np.concatenate([X_ref[att[:min_count]], X_ref[inatt[:min_count]]])
+y_ref = np.concatenate([y_ref[att[:min_count]], y_ref[inatt[:min_count]]])
+
+# Transforms
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -34,33 +40,53 @@ def get_embedding(frame):
     img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     img = transform(img).unsqueeze(0).to(device)
     with torch.no_grad():
-        embedding = model(img).squeeze().cpu().numpy()
-    return embedding
+        return model(img).squeeze().cpu().numpy()
 
-# OpenCV video
-cap = cv2.VideoCapture(0)
-buffer = deque(maxlen=10)
+def predict_similarity(embedding, top_k=5):
+    dists = cdist([embedding], X_ref, metric="cosine")[0]
+    nearest = np.argsort(dists)[:top_k]
+    labels = y_ref[nearest]
+    pred = np.bincount(labels).argmax()
+    confidence = (labels == pred).sum() / top_k
+    return pred, confidence * 100
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        st.warning("Could not access webcam.")
-        break
+# Streamlit UI
+st.title("🧠 Real-Time Attention Detection")
+frame_window = st.image([])
+status_text = st.empty()
+start = st.button("Start Webcam")
 
-    # Predict
-    emb = get_embedding(frame).reshape(1, -1)
-    proba = clf.predict_proba(emb)[0]
-    buffer.append(proba)
-    avg_proba = np.mean(buffer, axis=0)
+if start:
+    buffer = deque(maxlen=10)
+    cap = cv2.VideoCapture(0)
 
-    label = "Attentive" if np.argmax(avg_proba) == 0 else "Inattentive"
-    confidence = avg_proba[np.argmax(avg_proba)] * 100
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    # Draw on frame
-    color = (0, 255, 0) if label == "Attentive" else (0, 0, 255)
-    cv2.putText(frame, f"{label} ({confidence:.1f}%)", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+        emb = get_embedding(frame)
+        label_idx, conf = predict_similarity(emb)
+        buffer.append((label_idx, conf))
 
-    FRAME_WINDOW.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        # Smooth predictions
+        labels, confs = zip(*buffer)
+        final_label = max(set(labels), key=labels.count)
+        avg_conf = np.mean([c for l, c in buffer if l == final_label])
 
-cap.release()
+        label = "Attentive" if final_label == 0 else "Inattentive"
+        color = "green" if final_label == 0 else "red"
+
+        # Draw label
+        display_frame = frame.copy()
+        cv2.putText(display_frame, f"{label} ({avg_conf:.1f}%)",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                    (0, 255, 0) if final_label == 0 else (0, 0, 255), 2)
+
+        frame_window.image(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB))
+        status_text.markdown(f"### Status: <span style='color:{color}'>{label} ({avg_conf:.1f}%)</span>", unsafe_allow_html=True)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
