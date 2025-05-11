@@ -6,3 +6,4 @@ joblib
 pillow
 scikit-learn
 numpy
+python-multipart
