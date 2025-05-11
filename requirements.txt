@@ -7,3 +7,4 @@ pillow
 scikit-learn
 numpy
 python-multipart
+opencv-python-headless
